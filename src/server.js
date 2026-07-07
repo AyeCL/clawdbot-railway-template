@@ -703,6 +703,153 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+const MEETING_NOTES_HOOK_TOKEN =
+  process.env.OPENCLAW_MEETING_NOTES_WEBHOOK_SECRET?.trim() ||
+  process.env.OPENCLAW_MEETING_NOTES_HOOK_TOKEN?.trim();
+
+function safeSecretEqual(actual, expected) {
+  if (!actual || !expected) return false;
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  if (actualBytes.length !== expectedBytes.length) return false;
+  return crypto.timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function bearerToken(req) {
+  const header = String(req.headers.authorization || "");
+  const [scheme, token] = header.split(" ");
+  if (scheme === "Bearer" && token) return token.trim();
+  return String(req.headers["x-openclaw-webhook-secret"] || "").trim();
+}
+
+function requireMeetingNotesHookAuth(req, res, next) {
+  if (!MEETING_NOTES_HOOK_TOKEN) {
+    return res.status(500).type("text/plain").send("Meeting notes hook token is not configured");
+  }
+  if (!safeSecretEqual(bearerToken(req), MEETING_NOTES_HOOK_TOKEN)) {
+    return res.status(401).type("text/plain").send("Auth required");
+  }
+  return next();
+}
+
+function meetingNotesRunPath(idempotencyKey, suffix) {
+  const digest = crypto.createHash("sha256").update(idempotencyKey).digest("hex");
+  return path.join(STATE_DIR, "meeting-notes-runs", `${digest}${suffix}`);
+}
+
+function validateMeetingNotesHookPayload(payload) {
+  const message = String(payload?.message || "").trim();
+  const idempotencyKey = String(payload?.idempotencyKey || "").trim();
+  const channel = String(payload?.channel || "discord").trim();
+  const to = String(payload?.to || "").trim();
+
+  if (!message) return { ok: false, error: "Missing message" };
+  if (message.length > 128_000) return { ok: false, error: "Message is too large" };
+  if (!idempotencyKey) return { ok: false, error: "Missing idempotencyKey" };
+  if (idempotencyKey.length > 512) return { ok: false, error: "idempotencyKey is too long" };
+  if (channel !== "discord") return { ok: false, error: "Only discord delivery is supported" };
+  if (!/^channel:\d{5,30}$/.test(to)) return { ok: false, error: "Invalid Discord delivery target" };
+
+  return { ok: true, message, idempotencyKey, channel, to };
+}
+
+function spawnMeetingNotesRun(params) {
+  fs.mkdirSync(path.join(STATE_DIR, "meeting-notes-runs"), { recursive: true, mode: 0o700 });
+
+  const claimPath = meetingNotesRunPath(params.idempotencyKey, ".json");
+  const promptPath = meetingNotesRunPath(params.idempotencyKey, ".prompt.txt");
+  const logPath = meetingNotesRunPath(params.idempotencyKey, ".log");
+
+  let fd;
+  try {
+    fd = fs.openSync(claimPath, "wx", 0o600);
+  } catch (err) {
+    if (err?.code === "EEXIST") {
+      return { started: false, claimPath, promptPath, logPath };
+    }
+    throw err;
+  }
+
+  const startedAt = new Date().toISOString();
+  fs.writeFileSync(
+    fd,
+    JSON.stringify(
+      {
+        status: "started",
+        idempotencyKey: params.idempotencyKey,
+        channel: params.channel,
+        to: params.to,
+        startedAt,
+      },
+      null,
+      2,
+    ),
+  );
+  fs.closeSync(fd);
+
+  fs.writeFileSync(promptPath, params.message, { encoding: "utf8", mode: 0o600 });
+
+  const out = fs.openSync(logPath, "a", 0o600);
+  const child = childProcess.spawn(
+    OPENCLAW_NODE,
+    clawArgs([
+      "agent",
+      "--agent",
+      "main",
+      "--session-key",
+      `agent:main:meeting-notes-${crypto.createHash("sha256").update(params.idempotencyKey).digest("hex").slice(0, 24)}`,
+      "--message-file",
+      promptPath,
+      "--deliver",
+      "--reply-channel",
+      params.channel,
+      "--reply-to",
+      params.to,
+      "--json",
+      "--timeout",
+      "900",
+    ]),
+    {
+      detached: true,
+      stdio: ["ignore", out, out],
+      env: {
+        ...process.env,
+        OPENCLAW_STATE_DIR: STATE_DIR,
+        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      },
+    },
+  );
+
+  child.unref();
+  fs.closeSync(out);
+
+  return { started: true, pid: child.pid, claimPath, promptPath, logPath, startedAt };
+}
+
+app.post("/youanai/meeting-notes", requireMeetingNotesHookAuth, async (req, res) => {
+  try {
+    const payload = validateMeetingNotesHookPayload(req.body || {});
+    if (!payload.ok) {
+      return res.status(400).json({ ok: false, error: payload.error });
+    }
+
+    await ensureGatewayRunning();
+    const run = spawnMeetingNotesRun(payload);
+
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      started: run.started,
+      idempotencyKey: payload.idempotencyKey,
+      pid: run.pid,
+      skippedReason: run.started ? undefined : "already-started",
+    });
+  } catch (err) {
+    console.error("[/youanai/meeting-notes] error:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     const respondJson = (status, body) => {
